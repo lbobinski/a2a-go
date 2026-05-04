@@ -21,6 +21,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/eventqueue"
@@ -50,10 +51,11 @@ var (
 // Both cancelations and executions are started in detached context and run until completion.
 // The type is suitable only for single-process execution management.
 type localManager struct {
-	queueManager eventqueue.Manager
-	factory      Factory
-	store        taskstore.Store
-	panicHandler PanicHandlerFn
+	queueManager      eventqueue.Manager
+	factory           Factory
+	store             taskstore.Store
+	panicHandler      PanicHandlerFn
+	inactivityTimeout time.Duration
 
 	mu           sync.Mutex
 	executions   map[a2a.TaskID]*localExecution
@@ -89,18 +91,24 @@ type LocalManagerConfig struct {
 	Factory           Factory
 	TaskStore         taskstore.Store
 	PanicHandler      PanicHandlerFn
+	// AgentInactivityTimeout, if positive, terminates an execution when the
+	// agent's producer has not written any events to the pipe for the
+	// configured duration. The terminating cause is [ErrAgentInactivityTimeout].
+	// A value of 0 disables the watcher, preserving prior behavior.
+	AgentInactivityTimeout time.Duration
 }
 
 // NewLocalManager is a [localManager] constructor function.
 func NewLocalManager(cfg LocalManagerConfig) Manager {
 	manager := &localManager{
-		queueManager: cfg.QueueManager,
-		factory:      cfg.Factory,
-		store:        cfg.TaskStore,
-		panicHandler: cfg.PanicHandler,
-		limiter:      newConcurrencyLimiter(cfg.ConcurrencyConfig),
-		executions:   make(map[a2a.TaskID]*localExecution),
-		cancelations: make(map[a2a.TaskID]*cancelation),
+		queueManager:      cfg.QueueManager,
+		factory:           cfg.Factory,
+		store:             cfg.TaskStore,
+		panicHandler:      cfg.PanicHandler,
+		inactivityTimeout: cfg.AgentInactivityTimeout,
+		limiter:           newConcurrencyLimiter(cfg.ConcurrencyConfig),
+		executions:        make(map[a2a.TaskID]*localExecution),
+		cancelations:      make(map[a2a.TaskID]*cancelation),
 	}
 	if manager.queueManager == nil {
 		manager.queueManager = eventqueue.NewInMemoryManager()
@@ -283,12 +291,15 @@ func (m *localManager) handleExecution(ctx context.Context, execution *localExec
 		},
 		handleErrorFn: processor.ProcessError,
 	}
+	tracker := newInactivityTracker(m.inactivityTimeout)
+	producerWriter := newActivityTrackingWriter(execution.pipe.Writer, tracker)
 	result, err := runProducerConsumer(
 		ctx,
-		func(ctx context.Context) error { return executor.Execute(ctx, execution.pipe.Writer) },
+		func(ctx context.Context) error { return executor.Execute(ctx, producerWriter) },
 		handler.processEvents,
 		nil,
 		m.panicHandler,
+		tracker,
 	)
 
 	cleaner.Cleanup(ctx, result, err)
@@ -327,12 +338,15 @@ func (m *localManager) handleCancel(ctx context.Context, cancel *cancelation) {
 		handleEventFn: processor.Process,
 		handleErrorFn: func(ctx context.Context, err error) (a2a.SendMessageResult, error) { return nil, err },
 	}
+	tracker := newInactivityTracker(m.inactivityTimeout)
+	producerWriter := newActivityTrackingWriter(pipe.Writer, tracker)
 	result, err := runProducerConsumer(
 		ctx,
-		func(ctx context.Context) error { return canceler.Cancel(ctx, pipe.Writer) },
+		func(ctx context.Context) error { return canceler.Cancel(ctx, producerWriter) },
 		handler.processEvents,
 		nil,
 		m.panicHandler,
+		tracker,
 	)
 
 	cleaner.Cleanup(ctx, result, err)
