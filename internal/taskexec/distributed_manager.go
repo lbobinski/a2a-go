@@ -16,6 +16,7 @@ package taskexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -39,6 +40,7 @@ type DistributedManagerConfig struct {
 	ConcurrencyConfig limiter.ConcurrencyConfig
 	Logger            *slog.Logger
 	PanicHandler      PanicHandlerFn
+	ContextCodec      ContextCodec
 	// AgentInactivityTimeout, if positive, terminates an execution when the
 	// agent's producer has not written any events to the pipe for the
 	// configured duration. The terminating cause is [ErrAgentInactivityTimeout].
@@ -51,6 +53,7 @@ type distributedManager struct {
 	workQueue    workqueue.Queue
 	queueManager eventqueue.Manager
 	taskStore    taskstore.Store
+	ctxCodec     ContextCodec
 }
 
 var _ Manager = (*distributedManager)(nil)
@@ -62,6 +65,7 @@ func NewDistributedManager(cfg DistributedManagerConfig) Manager {
 		queueManager: cfg.QueueManager,
 		workQueue:    cfg.WorkQueue,
 		taskStore:    cfg.TaskStore,
+		ctxCodec:     cfg.ContextCodec,
 	}
 	return frontend
 }
@@ -110,10 +114,16 @@ func (m *distributedManager) Execute(ctx context.Context, req *a2a.SendMessageRe
 		}
 	}
 
+	encodedCtx, err := m.encodeContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	taskID, err := m.workQueue.Write(ctx, &workqueue.Payload{
 		Type:           workqueue.PayloadTypeExecute,
 		TaskID:         requestedTaskID,
 		ExecuteRequest: req,
+		CallContext:    encodedCtx,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create work item: %w", err)
@@ -154,15 +164,23 @@ func (m *distributedManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequ
 		return nil, fmt.Errorf("failed to get or create queue: %w", err)
 	}
 
+	encodedCtx, err := m.encodeContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	taskID, err := m.workQueue.Write(ctx, &workqueue.Payload{
 		Type:          workqueue.PayloadTypeCancel,
 		TaskID:        req.ID,
 		CancelRequest: req,
+		CallContext:   encodedCtx,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create work item: %w", err)
-	}
-	if taskID != req.ID {
+		// if cancelation lease is already taken we can tap into the running cancellation events
+		if !errors.Is(err, workqueue.ErrLeaseAlreadyTaken) {
+			return nil, fmt.Errorf("failed to create work item: %w", err)
+		}
+	} else if taskID != req.ID {
 		return nil, fmt.Errorf("bug: work-queue task id override is only allowed for executions")
 	}
 
@@ -196,4 +214,15 @@ func (m *distributedManager) Cancel(ctx context.Context, req *a2a.CancelTaskRequ
 	}
 
 	return convertToCancelationResult(ctx, storedTask.Task, nil)
+}
+
+func (m *distributedManager) encodeContext(ctx context.Context) (map[string]any, error) {
+	if m.ctxCodec == nil {
+		return nil, nil
+	}
+	r, err := m.ctxCodec.Encode(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("context encoding failed: %w", err)
+	}
+	return r, nil
 }
